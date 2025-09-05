@@ -1,31 +1,33 @@
-// tools/plugins/jsjiami_v7.js
-// 自适应还原：无硬编码名称/偏移；AST 识别字符串池 & 解码器 → 受控 VM 执行 → 替换调用点为字面量。
-// 仅做“可读化”，不改变原业务逻辑。失败则安全回退为原样。
+// 自适应 jsjiami v7 解混淆插件（无硬编码）：
+// - 自动识别“字符串池 + 解码器函数”
+// - 抽取前奏到受控 VM 执行（完成数组旋转/缓存）
+// - 将 _0x????(idx, key) 调用替换为字面量字符串
+// - 不改业务逻辑，失败安全回退为原样
 
-import { parse } from "@babel/parser";
-import traverse from "@babel/traverse";
-import generate from "@babel/generator";
 import * as t from "@babel/types";
+import { parse } from "@babel/parser";
+import traverseModule from "@babel/traverse";
+const traverse = traverseModule.default;               // ← 关键：ESM 默认导出
+import generateModule from "@babel/generator";
+const generate = generateModule.default;               // ← 关键：ESM 默认导出
 import vm from "node:vm";
 
 export default {
   name: "jsjiami_v7",
 
-  // 不依赖品牌字样：基于“字符串池 + 函数访问池”结构判断
   detect(code) {
     try {
       const ast = parse(code, { sourceType: "unambiguous", allowReturnOutsideFunction: true });
       const pools = findStringPools(ast);
       if (pools.length === 0) return false;
-      const fns = findPoolReaders(ast, new Set(pools.map(p => p.id)));
-      return fns.length > 0;
+      const readers = findPoolReaders(ast, new Set(pools.map(p => p.id)));
+      return readers.length > 0;
     } catch {
       return false;
     }
   },
 
   process(code) {
-    // 解析
     let ast;
     try {
       ast = parse(code, { sourceType: "unambiguous", allowReturnOutsideFunction: true });
@@ -33,43 +35,36 @@ export default {
       return code;
     }
 
-    // 识别字符串池 & 访问该池的函数（候选解码器）
-    const pools = findStringPools(ast);            // [{ id, node }]
+    // 1) 识别字符串池与候选解码器
+    const pools = findStringPools(ast);
     const poolIds = new Set(pools.map(p => p.id));
     if (poolIds.size === 0) return code;
 
-    const readers = findPoolReaders(ast, poolIds); // [{ name, node }]
+    const readers = findPoolReaders(ast, poolIds);
     if (readers.length === 0) return code;
 
-    // 抽取“前奏代码”：包含所有出现 poolId 的顶层语句（池声明、旋转 IIFE、解码器函数等）
+    // 2) 构建并执行前奏（仅含与 pool 相关的顶层语句）
     const prelude = buildPrelude(code, ast, poolIds);
-
-    // 构建受控沙盒，执行前奏代码（让旋转/缓存等完成），拿到真实函数引用
     const sandbox = buildSandbox();
     try {
       vm.runInNewContext(prelude, sandbox, { timeout: 1000, microtaskMode: "afterEvaluate" });
     } catch {
-      // 前奏执行失败，放弃替换
-      return code;
+      return code; // 前奏执行失败 → 保守回退
     }
 
-    // 选择在沙盒里真实可用的“解码器函数集合”
+    // 3) 从沙盒中挑出真正能解码的函数
     const decoderNames = pickDecodersInSandbox(sandbox, readers);
+    if (decoderNames.size === 0) return code;
 
-    if (decoderNames.size === 0) {
-      // 没有可用的解码器则不动
-      return code;
-    }
-
-    // 第二遍 AST：替换所有对解码器的调用为字面量字符串
+    // 4) AST 替换：把解码调用替换成字面量
     let changed = false;
     traverse(ast, {
-      CallExpression(path) {
-        const callee = path.node.callee;
+      CallExpression(p) {
+        const callee = p.node.callee;
         if (!t.isIdentifier(callee)) return;
         if (!decoderNames.has(callee.name)) return;
 
-        const args = path.node.arguments;
+        const args = p.node.arguments;
         if (args.length === 0) return;
 
         const idxNum = evalNumeric(args[0]);
@@ -77,8 +72,8 @@ export default {
 
         let keyVal = undefined;
         if (args[1]) {
-          const k = evalStringOrNumber(args[1]);
-          if (typeof k === "string" || typeof k === "number") keyVal = k;
+          const v = evalStringOrNumber(args[1]);
+          if (typeof v === "string" || typeof v === "number") keyVal = v;
         }
 
         try {
@@ -86,11 +81,11 @@ export default {
           if (typeof fn !== "function") return;
           const out = (args.length >= 2) ? fn(idxNum, keyVal) : fn(idxNum);
           if (typeof out === "string") {
-            path.replaceWith(t.stringLiteral(out));
+            p.replaceWith(t.stringLiteral(out));
             changed = true;
           }
         } catch {
-          // 解码失败则保持原样
+          // 单点失败保持原样
         }
       }
     });
@@ -99,9 +94,9 @@ export default {
   }
 };
 
-/* ===================== 工具函数区域 ===================== */
+/* ================= 工具函数 ================= */
 
-// 找大量字符串的数组声明（字符串池）
+// 识别大数组的字符串池
 function findStringPools(ast) {
   const pools = [];
   traverse(ast, {
@@ -119,134 +114,102 @@ function findStringPools(ast) {
   return pools;
 }
 
-// 找访问字符串池的函数（候选解码器）：函数体内出现 poolId[...]，且索引表达式依赖其形参
+// 找到访问“字符串池[computedIndex]”且索引依赖形参的函数（候选解码器）
 function findPoolReaders(ast, poolIds) {
   const readers = [];
-  function isReader(fnPath) {
-    const node = fnPath.node;
-    const id = node.id && node.id.name ? node.id.name : (
-      // 匿名函数可能赋值给变量
-      t.isVariableDeclarator(fnPath.parent) && t.isIdentifier(fnPath.parent.id)
-        ? fnPath.parent.id.name
-        : null
-    );
-    if (!id) return null;
 
-    const params = node.params.map(p => t.isIdentifier(p) ? p.name : null).filter(Boolean);
+  function inspectFn(node, fnName) {
+    const params = node.params.map(p => (t.isIdentifier(p) ? p.name : null)).filter(Boolean);
     if (params.length === 0) return null;
 
     let touchesPool = false;
     let usesParamInIndex = false;
 
-    fnPath.traverse({
+    traverse(node, {
       MemberExpression(me) {
-        if (!t.isIdentifier(me.node.object)) return;
-        if (!poolIds.has(me.node.object.name)) return;
+        const obj = me.node.object;
+        if (!t.isIdentifier(obj)) return;
+        if (!poolIds.has(obj.name)) return;
         touchesPool = true;
 
         if (me.node.computed && me.node.property) {
-          if (dependsOnParams(me.node.property, params)) usesParamInIndex = true;
+          if (exprDependsOnParams(me.node.property, params)) usesParamInIndex = true;
         }
       }
-    });
+    }, undefined, undefined); // 这里传 node 子树本身没问题
 
     if (touchesPool && usesParamInIndex) {
-      return { name: id, node };
+      return { name: fnName, node };
     }
     return null;
   }
 
   traverse(ast, {
     FunctionDeclaration(p) {
-      const hit = isReader(p);
+      const id = p.node.id?.name;
+      if (!id) return;
+      const hit = inspectFn(p.node, id);
       if (hit) readers.push(hit);
     },
     VariableDeclarator(p) {
+      const id = t.isIdentifier(p.node.id) ? p.node.id.name : null;
       const init = p.node.init;
+      if (!id) return;
       if (t.isFunctionExpression(init) || t.isArrowFunctionExpression(init)) {
-        const fake = { node: init, parent: p.node, traverse: (v) => traverse(init, v) };
-        const hit = (function () {
-          const node = init;
-          const id = t.isIdentifier(p.node.id) ? p.node.id.name : null;
-          if (!id) return null;
-
-          const params = node.params.map(q => t.isIdentifier(q) ? q.name : null).filter(Boolean);
-          if (params.length === 0) return null;
-
-          let touchesPool = false;
-          let usesParamInIndex = false;
-          traverse(init, {
-            MemberExpression(me) {
-              if (!t.isIdentifier(me.node.object)) return;
-              if (!poolIds.has(me.node.object.name)) return;
-              touchesPool = true;
-              if (me.node.computed && me.node.property) {
-                if (dependsOnParams(me.node.property, params)) usesParamInIndex = true;
-              }
-            }
-          });
-          if (touchesPool && usesParamInIndex) {
-            return { name: id, node: init };
-          }
-          return null;
-        })();
+        const hit = inspectFn(init, id);
         if (hit) readers.push(hit);
       }
     }
   });
 
-  // 去重（按函数名）
+  // 去重
   const seen = new Set();
   return readers.filter(r => (seen.has(r.name) ? false : (seen.add(r.name), true)));
 }
 
-// 判断表达式是否依赖给定参数名之一（简易版）
-function dependsOnParams(expr, params) {
+// 判断表达式是否依赖参数名（不用 traverse 直接跑子树，自己递归更稳）
+function exprDependsOnParams(expr, params) {
   let dep = false;
-  traverse(expr, {
-    Identifier(idp) {
-      if (params.includes(idp.node.name)) dep = true;
+  (function walk(n) {
+    if (!n || dep) return;
+    if (t.isIdentifier(n) && params.includes(n.name)) { dep = true; return; }
+    for (const k of Object.keys(n)) {
+      const v = n[k];
+      if (Array.isArray(v)) v.forEach(walk);
+      else if (v && typeof v === "object" && "type" in v) walk(v);
     }
-  }, expr.scope, expr);
+  })(expr);
   return dep;
 }
 
-// 构建前奏代码：收集所有包含 poolId 的顶层语句（顺序按源码）
+// 构建“前奏代码”：挑出所有包含任一 poolId 的顶层语句（顺序保持）
 function buildPrelude(source, ast, poolIds) {
-  const picks = [];
+  const snippets = [];
   traverse(ast, {
     Program(p) {
       for (const node of p.node.body) {
         const code = generate(node).code;
         for (const pid of poolIds) {
-          if (code.includes(pid)) { picks.push(code); break; }
+          if (code.includes(pid)) { snippets.push(code); break; }
         }
       }
     }
   });
-  // 在沙盒注入一个占位数组用于后续检测
+  // 轻度沙盒硬化（屏蔽 require/process）
   const header = `
-;(() => {
-  try {
-    // 防止外部对象被访问
-    const g = (1,eval)('this');
-    if (g) { g.require = undefined; g.process = undefined; }
-  } catch {}
-})();`;
-  return header + "\n" + picks.join("\n");
+;(() => { try {
+  const g = (1,eval)('this');
+  if (g) { g.require = undefined; g.process = undefined; }
+} catch(_){} })();`;
+  return header + "\n" + snippets.join("\n");
 }
 
-// 构建受控沙盒（禁用敏感对象，提供 atob/btoa）
+// 受控沙盒
 function buildSandbox() {
   const sb = Object.create(null);
   const atob = (s) => Buffer.from(String(s), "base64").toString("binary");
   const btoa = (s) => Buffer.from(String(s), "binary").toString("base64");
-
   Object.assign(sb, {
-    globalThis: null,
-    self: null,
-    window: null,
-    document: {},
     console: { log(){}, warn(){}, error(){} },
     setTimeout(){ throw new Error("blocked"); },
     setInterval(){ throw new Error("blocked"); },
@@ -256,30 +219,24 @@ function buildSandbox() {
   return sb;
 }
 
-// 在沙盒里筛选真实可调用的解码器函数
+// 在沙盒里选出能返回 string 的解码器函数
 function pickDecodersInSandbox(sandbox, readers) {
   const names = new Set();
   for (const r of readers) {
     const fn = sandbox[r.name];
     if (typeof fn !== "function") continue;
-    // 试探调用：尝试若干索引，能返回字符串即认为有效
+
     let ok = false;
     for (const idx of [0,1,2,3,4,5,10,16,32,64,128,255]) {
-      try {
-        const out = fn(idx, "test");
-        if (typeof out === "string") { ok = true; break; }
-      } catch {}
-      try {
-        const out2 = fn(idx);
-        if (typeof out2 === "string") { ok = true; break; }
-      } catch {}
+      try { if (typeof fn(idx, "x") === "string") { ok = true; break; } } catch {}
+      try { if (typeof fn(idx) === "string") { ok = true; break; } } catch {}
     }
     if (ok) names.add(r.name);
   }
   return names;
 }
 
-// 计算简单数值（支持 0x.., +/-, 二元运算）
+// 计算简单数值（0x/一元/常见二元）
 function evalNumeric(node) {
   if (t.isNumericLiteral(node)) return node.value;
   if (t.isUnaryExpression(node) && (node.operator === "+" || node.operator === "-")) {
@@ -306,15 +263,14 @@ function evalNumeric(node) {
     }
   }
   if (t.isStringLiteral(node)) {
-    // 形如 "0x1a" 的字符串
-    const m = /^0x[0-9a-f]+$/i.exec(node.value);
-    if (m) return parseInt(node.value, 16);
-    if (/^\d+$/.test(node.value)) return parseInt(node.value, 10);
+    const s = node.value;
+    if (/^0x[0-9a-f]+$/i.test(s)) return parseInt(s, 16);
+    if (/^\d+$/.test(s)) return parseInt(s, 10);
   }
   return null;
 }
 
-// 尽量把字面求成基本值（字符串/数字），否则返回 null
+// 字面量尽量算成 string/number
 function evalStringOrNumber(node) {
   if (t.isStringLiteral(node)) return node.value;
   const n = evalNumeric(node);
