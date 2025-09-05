@@ -1,43 +1,36 @@
-name: 自动解密流水线
+name: Decode JavaScript File
 
 on:
   push:
-    paths:
-      - 'input/**'
-      - 'tools/**'
-      - 'package.json'
-  workflow_dispatch: {}
-
-permissions:
-  contents: write
-  issues: write
-
+    branches:
+      - main
 jobs:
   decode:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v2
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
+    - name: Execute Python script for decoding
+      run: |
+        python src/decode.py
 
-      - name: Install deps
-        run: npm install
-
-      - name: Run deobfuscation
-        run: npm run decode
-
-      - name: Commit results
-        run: |
-          if [ -n "$(git status --porcelain decoded)" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add decoded
-            git commit -m "chore(decoded): auto-deob @ $(date -u '+%Y-%m-%d %H:%M:%S')"
-            git push
-          else
-            echo "No changes in decoded/"
-          fi
+    - name: Install dependencies and run decode
+      run: |
+        npm install
+        npm run decode -- [-i input.js] [-o output.js]
+    - name: Configure Git author
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "action"
+    - name: Save decoded output to repository
+      run: |
+        git status
+        ls
+        git add output.js
+        git add output.py
+        git commit -m "Add decoded output file"
+        git push
+        
