@@ -1,0 +1,43 @@
+name: 自动解密流水线
+
+on:
+  push:
+    paths:
+      - 'input/**'
+      - 'tools/**'
+      - 'package.json'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  decode:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install deps
+        run: npm ci || npm i
+
+      - name: Run deobfuscation
+        run: npm run decode
+
+      - name: Commit results
+        run: |
+          if [ -n "$(git status --porcelain decoded)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add decoded
+            git commit -m "chore(decoded): auto-deob @ $(date -u '+%Y-%m-%d %H:%M:%S')"
+            git push
+          else
+            echo "No changes in decoded/"
+          fi
