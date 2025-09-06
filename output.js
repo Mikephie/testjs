@@ -1,7 +1,7 @@
-//Sat Sep 06 2025 00:48:30 GMT+0000 (Coordinated Universal Time)
+//Sat Sep 06 2025 00:50:32 GMT+0000 (Coordinated Universal Time)
 //Base: https://github.com/echo094/decode-js
 //Modify: https://github.com/smallfawn/decode_action
-const version = 'V1.0.9888';
+const version = 'V1.0.9888000';
 var _0xodH = 'jsjiami.com.v7';
 const _0xc3dd0a = _0x1e61;
 if (function (_0x297b99, _0x23f2e1, _0x6df70d, _0x3c23f, _0x377ebd, _0x2c90c8, _0x4be525) {
